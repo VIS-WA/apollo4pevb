@@ -7,6 +7,7 @@ Setting up:
 - write the code in src/main.c
 - cd to ```gcc```.
 - configure the `Makefile` by setting `TARGET` which is name of the project, and `TOP_DIR` which is the path to the SDK
+- add any paths to include libraries
 - compile using ```make```. The binary files is created as `bin/main.bin`.
 - Flash this binary file using JFlashLite
 - Apollo 4 Plus EVB config for JFlashLite:
