@@ -1,7 +1,6 @@
 # apollo4pevb
 
-Current code is for toggling the three onboard LEDs.
-
+Current code is for 
 Setting up:
 - place ```templates``` in examples folder of Ambiq Apollo 4 SDK.
 - write the code in src/main.c
@@ -16,4 +15,7 @@ Setting up:
   - Speed: 4000kHz
   - Prog. addr.: 0x00018000
  
- 
+ Available Codes:
+ - `src/spi.c`: SPI code for ADC ADS7042
+ - `src/uart.h`: UART code
+ - `src/led.c`: Sample LED code for toggling the three onboard LEDs.
