@@ -150,3 +150,148 @@ int main(void) {
         am_util_delay_ms(1000);  // delay 1s between readings (adjust as needed)
     }
 }
+
+
+/*
+16th April 2025
+
+#include "am_mcu_apollo.h"
+#include "uart.h"
+
+#define NUM_SAMPLES 1000000  // 1,000,000 samples
+
+static volatile uint16_t adc_buffer_mram[NUM_SAMPLES] __attribute__((section(".shared"))) ;  // >1M then shared memory, else TCM
+static uint32_t iom_dma_buffer[256] ;  // DMA transaction buffer for IOM (command queue)
+
+// Handles IOM
+static void *IOMHandle;
+
+// Flags and counters for transfer status
+static volatile bool transfer_done = false;
+static volatile uint32_t sample_count = 0;
+
+// IOM1 interrupt service routine (ISR)
+void am_iomaster1_isr(void) {
+    uint32_t ui32Status;
+    // Get and clear the interrupt status
+    am_hal_iom_interrupt_status_get(IOMHandle, false, &ui32Status);
+    am_hal_iom_interrupt_clear(IOMHandle, ui32Status);
+    // Service the interrupt (will call the callback if a transaction completed)
+    am_hal_iom_interrupt_service(IOMHandle, ui32Status);
+}
+
+uint32_t spi_transaction(uint32_t count);
+// DMA transfer completion callback for each sample
+void iom_dma_callback(void *pCallbackCtxt, uint32_t transactionStatus) {
+    if (transactionStatus != AM_HAL_STATUS_SUCCESS) {
+        // Handle error (optional: set an error flag, etc.)
+        transfer_done = true;
+        am_util_stdio_printf("DMA transaction error: 0x%X\n", transactionStatus);
+        return;
+    }
+    // Process the just-received sample: extract 12-bit value from 14-bit frame
+    // According to ADS7042 datasheet, first two bits of SDO frame are 0, next 12 bits are data
+    // The 16-bit word has data in bits [13:2] (bits 15,14,1,0 are 0). Right-shift by 2 to get 12-bit result.
+    // uint16_t raw_value = adc_buffer_mram[sample_count]; 
+    // adc_buffer_mram[sample_count] = (raw_value >> 2) & 0x0FFF;  // Keep only the 12-bit ADC result
+
+    // uint8_t *pRx = (uint8_t *)&adc_buffer_mram[sample_count];
+    // uint16_t raw = ((uint16_t)pRx[0] << 8) | pRx[1];
+    // raw = (raw >> 2) & 0x0FFF;
+    // adc_buffer_mram[sample_count] = raw;  // Store the 12-bit ADC result in the buffer
+
+    sample_count++;
+    if (sample_count < NUM_SAMPLES) {
+        // Schedule the next sample read (1 transfer = 1 sample) using DMA
+        spi_transaction(sample_count);  // Start the next sample read via DMA
+    } else {
+        // All samples captured
+        transfer_done = true;
+        am_util_stdio_printf("DMA transfer complete. %u samples captured.\n", NUM_SAMPLES);
+    }
+}
+
+uint32_t spi_transaction(uint32_t count){
+    am_hal_iom_transfer_t Transaction;
+        Transaction.uPeerInfo.ui32SpiChipSelect = 0;     // Chip select 0 (configured for ADS7042)
+        Transaction.ui32InstrLen = 0;                    // No instruction bytes
+        Transaction.ui64Instr    = 0;                    // (Not used for SPI read here)
+        Transaction.eDirection   = AM_HAL_IOM_RX;        // Receive from ADC
+        Transaction.ui32NumBytes = 2;                    // 2 bytes per sample (16 bits, contains 12-bit data)
+        Transaction.pui32TxBuffer = NULL;
+        Transaction.pui32RxBuffer = (uint32_t *)&adc_buffer_mram[count];  // store next sample
+        Transaction.bContinue    = false;                // De-assert CS after each transfer (no continuous chip select)
+        Transaction.ui8Priority  = 1;                    // High priority (if applicable)
+        Transaction.ui32PauseCondition = 0;
+        Transaction.ui32StatusSetClr   = 0;
+
+        // am_util_stdio_printf("Count: %u\n", count);
+        return am_hal_iom_nonblocking_transfer(IOMHandle, &Transaction, iom_dma_callback, NULL);
+
+}
+
+
+// Set up IOM1 for SPI communication with ADS7042 (16MHz, mode 0, DMA enabled)
+void iom_set_up(void) {
+    // Initialize IOM1 (SPI master)
+    am_hal_iom_initialize(1, &IOMHandle);
+    am_hal_iom_power_ctrl(IOMHandle, AM_HAL_SYSCTRL_WAKE, false);
+
+    // Configure IOM1 for SPI mode 0, 16 MHz, with command queue (DMA) enabled
+    am_hal_iom_config_t iom_cfg = {
+        .eInterfaceMode    = AM_HAL_IOM_SPI_MODE,
+        .ui32ClockFreq     = AM_HAL_IOM_16MHZ,
+        .eSpiMode          = AM_HAL_IOM_SPI_MODE_0,  // SPI mode 0 (CPOL=0, CPHA=0)
+        .pNBTxnBuf         = iom_dma_buffer,
+        .ui32NBTxnBufLength= sizeof(iom_dma_buffer) / 4  // Length in words
+    };
+    am_hal_iom_configure(IOMHandle, &iom_cfg);
+
+    am_hal_gpio_pinconfig(AM_BSP_GPIO_IOM1_SCK,  g_AM_BSP_GPIO_IOM1_SCK);
+    am_hal_gpio_pinconfig(AM_BSP_GPIO_IOM1_MISO, g_AM_BSP_GPIO_IOM1_MISO);
+    am_hal_gpio_pinconfig(AM_BSP_GPIO_IOM1_CS,   g_AM_BSP_GPIO_IOM1_CS);
+
+    // Enable IOM1 interrupts for DMA complete (and errors)
+    am_hal_iom_interrupt_enable(IOMHandle, AM_HAL_IOM_INT_DCMP);
+    NVIC_SetPriority(IOMSTR1_IRQn, 2);
+    NVIC_EnableIRQ(IOMSTR1_IRQn);
+
+    // Enable the IOM1 module
+    am_hal_iom_enable(IOMHandle);
+}
+
+
+int main(void) {
+    // Initialize UART for output (disable printing in loop for speed, but for now just init for final prints)
+    uart_init();
+    am_hal_pwrctrl_low_power_init(); // helps to reduce power consumption
+    // Set up SPI interface on IOM1 for ADC
+    iom_set_up();
+
+    // Begin ADC sampling loop using DMA
+    am_util_stdio_printf("Starting ADC capture of %d samples...\r\n", NUM_SAMPLES);
+    // Prepare first SPI DMA transaction (1 sample)
+    sample_count = 0;
+    transfer_done = false;
+
+    spi_transaction(sample_count);  // Start the first sample read via DMA
+    am_util_delay_ms(1000);  // Optional delay to allow for setup time (if needed)
+    // Wait for the DMA sampling to complete (no debug printing in this loop for performance)
+    while (!transfer_done) {
+        // Enter sleep mode while waiting for interrupts (to reduce CPU load during sampling)
+        // am_hal_sysctrl_sleep(AM_HAL_SYSCTRL_SLEEP_DEEP);
+    }
+
+    // Capture complete, print the first few samples for verification
+    am_util_stdio_printf("ADC capture complete. First 10 samples:\r\n");
+        for (uint32_t i = 0; i < 10 && i < NUM_SAMPLES; i++) {
+        uint8_t *pRx = (uint8_t *)&adc_buffer_mram[i];
+        uint16_t raw = ((uint16_t)pRx[0] << 8) | pRx[1];
+        raw = (raw >> 2) & 0x0FFF;
+        am_util_stdio_printf("Sample %u: %d\r\n", i, raw);
+    }
+    return 0;
+
+}
+
+*/
